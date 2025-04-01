@@ -1,21 +1,38 @@
 import pandas as pd
 import json
 import os
+import requests
 from openai import OpenAI
 from dotenv import load_dotenv
+import time
 
 # 환경 변수 .env 파일 로드 (api key를 숨기기 위한 용도)
 load_dotenv()
 
-def analyze_large_dataset(csv_path, text_column, tag_definitions, batch_size=100, api_key=None):
+
+# OpenAI 토큰 제한 설정
+
+# gpt-4o-mini 모델 사용
+# gpt-4o-mini의 토큰 제한은 분당 토큰 20만개, request 한 번에 128000개
+# 데이터 100개당 토큰 약 20만개
+MODEL = "gpt-4o-mini"
+MAX_TOKENS_PER_REQUEST = 128000
+TOKENS_PER_MINUTE = 200000
+TOKEN_BUFFER = 1000  # 여유 토큰
+
+
+def estimate_tokens(text):
+    # 텍스트의 토큰 수를 대략적으로 추정
+    return len(text) // 4 # 평균적으로 토큰 하나는 약 4자
+
+
+def analyze_dataset_with_dynamic_batching(full_df, text_column, tag_definitions):
     # API 키 설정
-    api_key = api_key or os.getenv("OPENAI_API_KEY")
+    api_key = os.getenv("OPENAI_API_KEY")
+    print(f"총 데이터 개수: {len(full_df)} 개")
 
     # OpenAI 클라이언트 초기화 (한 번만 생성)
     client = OpenAI(api_key=api_key)
-
-    # 전체 데이터 로드
-    full_df = pd.read_csv(csv_path)
 
     # ID 컬럼 확인/생성
     if 'id' not in full_df.columns:
@@ -23,41 +40,36 @@ def analyze_large_dataset(csv_path, text_column, tag_definitions, batch_size=100
 
     # 결과 저장용 리스트
     all_tagged_data = []
+    remaining_tokens = TOKENS_PER_MINUTE  # 매 분 사용할 수 있는 토큰 수
+    current_batch = 0   # 현재 배치 카운팅용 변수
+    batch_size = 10  # 초기 배치 크기
+    i = 0
 
-    # 총 배치 개수 정리
-    total_batches = (len(full_df) + batch_size - 1) // batch_size
-
-    for i in range(total_batches):
-        start_idx = i * batch_size
-        end_idx = min((i + 1) * batch_size, len(full_df))
-
-        print(f"배치 {i + 1}/{total_batches} 처리 중... ({start_idx}~{end_idx})")
-
-        # 배치 추출
-        batch_df = full_df.iloc[start_idx:end_idx].copy()
-
-        # 임시 CSV 저장
-        temp_csv = f".temp/temp_batch_{i}.csv"
-        os.makedirs(".temp/", exist_ok=True)
-        batch_df.to_csv(temp_csv, index=False)
-
-        # 배치 데이터를 JSON으로 변환
+    while i < len(full_df):
+        start_idx = i
+        batch_size = min(batch_size, len(full_df) - i)  # 아직 남은 데이터에 맞게 batch_size 조정
+        end_idx = i + batch_size
+        batch_df = full_df.iloc[start_idx:end_idx]
         batch_json = batch_df.to_json(orient='records', indent=2)
-
-        # 프롬프트 생성
         prompt = create_prompt(batch_json, text_column, tag_definitions)
-        print(f"배치 {i + 1} prompt length: {len(prompt)}")
+        token_count = estimate_tokens(prompt) + TOKEN_BUFFER
+
+        print(f"\n[배치 {current_batch}] 처리 중... ({start_idx}~{end_idx})")
+
+        if token_count > MAX_TOKENS_PER_REQUEST:
+            batch_size = max(1, batch_size // 2)
+            print(f"토큰 초과 예상! 배치 크기를 {batch_size}로 조정")
+            continue  # 배치 크기 조정 후 다시 시도
+
+        if token_count > remaining_tokens:
+            sleep_time = 60  # 1분 대기하여 토큰 제한 회복
+            print(f"분당 토큰 제한 초과 예상! {sleep_time}초 대기")
+            time.sleep(sleep_time)
+            remaining_tokens = TOKENS_PER_MINUTE
+
 
         # API 호출
         try:
-            # print("test")
-            # response = client.responses.create(
-            #     model="gpt-4o-mini",
-            #     input="Write a one-sentence bedtime story about a unicorn."
-            # )
-            # print(response.output_text)
-            # return None
-
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
@@ -81,23 +93,36 @@ def analyze_large_dataset(csv_path, text_column, tag_definitions, batch_size=100
                 batch_tagged_data = json.loads(json_content)
                 if batch_tagged_data:
                     all_tagged_data.extend(batch_tagged_data)
+                print(f"결과: {batch_tagged_data}")
             except json.JSONDecodeError:
-                print(f"배치 {i + 1} JSON 파싱 오류. 원본 응답:")
+                print(f"JSON 파싱 오류. 원본 응답:")
                 print(content)
 
+            remaining_tokens -= token_count
+            print(f"처리 완료, 남은 토큰: {remaining_tokens}")
+            i += batch_size  # 다음 배치로 이동
+            current_batch += 1  # 현재 배치 업데이트
+
+            # batch_size 동적 조절: 토큰이 충분하면 증가, 부족하면 감소
+            if token_count < MAX_TOKENS_PER_REQUEST // 2:
+                batch_size = min(batch_size * 2, len(full_df) - i)
+
+            # 한 번에 128000 토큰 보내고, 분당 20만 토큰 제한이니까 매번 20초 기다릴 필요 없을 듯
+            # (이 코드 삭제 예정)
+            # time.sleep(20)  # API 호출 간격 유지
+
         except Exception as e:
-            print(f"배치 {i + 1} 처리 중 오류 발생: {str(e)}")
+            print(f"에러 발생: {e}")
+            if "maximum context length" in str(e) or "too many tokens" in str(e):
+                batch_size = max(1, batch_size // 2)  # 배치 크기 줄이기
+                print(f"배치 크기를 {batch_size}로 줄여서 재시도")
+            else:
+                # 다른 에러시 1분 뒤 재시도
+                print("1분 뒤 재시도")
+                time.sleep(60)  # 1분 뒤 재시도
 
-        # 임시 파일 삭제
-        if os.path.exists(temp_csv):
-            os.remove(temp_csv)
+    return all_tagged_data
 
-    # 전체 결과 저장
-    if all_tagged_data:
-        tag_groups = save_tagged_data_to_csv(all_tagged_data, full_df)
-        return tag_groups
-    else:
-        return None
 
 
 def create_prompt(dataset_json, text_column, tag_definitions):
@@ -115,7 +140,9 @@ def create_prompt(dataset_json, text_column, tag_definitions):
     1. 특별한 특징이 없는 데이터는 태그를 부여하지 않습니다.
     2. 각 데이터는 여러 태그를 가질 수 있습니다.
     3. 주 분석 대상은 '{text_column}' 컬럼이지만, 다른 컬럼의 정보도 참고하여 분석하세요.
-    4. 데이터셋 전체 맥락에서 특징적인 항목만 태그를 부여하세요.
+    4. 데이터 중 컬럼 일부의 값들이 null인 경우는 그 값들 수집에 실패해서 존재하지 않는 것입니다. 태그 분석 시 이러한 컬럼의 정보는 참고하면 안 됩니다.
+    5. 데이터셋 전체 맥락에서 특징적인 항목만 태그를 부여하세요.
+    6. 태그 선정 기준이 너무 느슨하지 말고 빡빡해야 합니다.
 
     ## 데이터셋
     {dataset_json}
@@ -133,16 +160,16 @@ def create_prompt(dataset_json, text_column, tag_definitions):
     return prompt
 
 
-def analyze_and_save_tagged_data(csv_path, text_column, tag_definitions, api_key=None):
+def analyze_and_save(csv_path, text_column, tag_definitions):
     # 원본 데이터 로드
     df = pd.read_csv(csv_path)
 
     # API 분석 수행
-    tagged_data = analyze_large_dataset(csv_path, text_column, tag_definitions, api_key=api_key)
+    tagged_data = analyze_dataset_with_dynamic_batching(df, text_column, tag_definitions)
 
     if tagged_data:
         # 태그별 CSV 파일 저장
-        tag_groups = save_tagged_data_to_csv(tagged_data, df)
+        tag_groups = save_tagged_data_to_csv(tagged_data, df, csv_path)
         return tag_groups
     else:
         print("\n분석 결과가 없습니다.")
@@ -150,8 +177,19 @@ def analyze_and_save_tagged_data(csv_path, text_column, tag_definitions, api_key
 
 
 
-def save_tagged_data_to_csv(tagged_data, original_df, output_dir="/tagged_dataset"):
-    # 출력 디렉토리 생성
+def save_tagged_data_to_csv(tagged_data, original_df, csv_path, output_dir="result"):
+    print("\n태그별 데이터 저장")
+
+    # 실행 중인 프로젝트 폴더 내부의 result 디렉토리 설정
+    base_dir = os.getcwd()  # 현재 프로젝트 디렉토리
+    output_dir = os.path.join(base_dir, output_dir)
+
+    # 원본 CSV 파일 이름을 사용하여 저장 폴더 생성
+    file_name = os.path.basename(csv_path)
+    file_name_without_ext = os.path.splitext(file_name)[0]
+    output_dir = os.path.join(output_dir, file_name_without_ext)
+
+    # 출력 디렉토리들 생성
     os.makedirs(output_dir, exist_ok=True)
 
     # 태그별 데이터 그룹화
@@ -164,7 +202,7 @@ def save_tagged_data_to_csv(tagged_data, original_df, output_dir="/tagged_datase
 
         # 원본 데이터 찾기
         original_data = original_df[original_df['id'] == data_id].copy()
-        if len(original_data) == 0:
+        if original_data.empty:
             continue
 
         # 분석 이유 추가
@@ -182,8 +220,10 @@ def save_tagged_data_to_csv(tagged_data, original_df, output_dir="/tagged_datase
             combined_data = pd.concat(data_list)
             # 태그 이름에서 CSV 파일명에 적합하지 않은 문자 제거
             safe_tag_name = ''.join(c if c.isalnum() or c in ['-', '_'] else '_' for c in tag)
-            output_path = os.path.join(output_dir, f"tag_{safe_tag_name}.csv")
-            combined_data.to_csv(output_path, index=False)
+            output_path = os.path.join(output_dir, f"{safe_tag_name}.csv")
+
+            combined_data.to_csv(output_path, index=False, encoding='utf-8-sig')
+
             print(f"'{tag}' 태그 파일 저장 완료: {output_path}")
 
     return tag_groups
@@ -207,7 +247,7 @@ def main():
     """
 
     # 함수 실행
-    analyze_and_save_tagged_data(
+    analyze_and_save(
         csv_path="dataset/genesis_mid.csv",
         text_column="설명글",
         tag_definitions=tag_definitions
